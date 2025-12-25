@@ -95,16 +95,16 @@ import numpy as np
 
 class SIDataset(Dataset):
     """Synthetic Image Detection Dataset - 分辨真实/合成/篡改图像"""
-    def __init__(self, dataset, tokenizer, image_processor):
+    def __init__(self, dataset, tokenizer, image_processor, mask_processor=None):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.image_processor = image_processor
+        self.mask_processor = mask_processor
         self.label_map = {
-            0: "this is real image.",
-            1: "this is full synthetic image.",
-            2: "this is tampered image."
+            0: "<CLS> this is real image.",
+            1: "<CLS> this is full synthetic image.",
+            2: "<CLS> this is tampered image. <SEG>"
         }
-        # 优化问题提示，使其更适合生成任务
         self.question_prompt = "Question: Is this image real, full synthetic or tampered? Answer:"
 
     def __len__(self):
@@ -113,27 +113,49 @@ class SIDataset(Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         
-        # 处理图像
+        # === 处理主图像 ===
         image = item['image']
         if not isinstance(image, Image.Image):
-            print(f"Invalid image type at index {idx}, expected PIL.Image")
-            processed_image = torch.zeros(
-                3, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size
-            )
+            warnings.warn(f"Invalid image type at index {idx}, expected PIL.Image. Using zero tensor.")
+            processed_image = torch.zeros(3, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size)
         else:
             if image.mode != 'RGB':
                 image = image.convert('RGB')
             processed_image = self.image_processor(image)
-        
-        # 处理label并生成答案
+
+        # === 处理标签和答案 ===
         label = item['label']
         if label not in self.label_map:
             raise ValueError(f"Invalid label {label} at index {idx}. Must be 0, 1, or 2.")
-        
         answer = self.label_map[label] + self.tokenizer.eos_token * 3
-        
+
+        # === 处理掩码（仅 tampered image 有，但数据集可能统一提供）===
+ # === 处理掩码（仅 tampered image 有，但数据集可能统一提供）===
+        mask = item.get('mask', None)
+        processed_mask = None
+        if mask is not None:
+            if not isinstance(mask, Image.Image):
+                warnings.warn(f"Invalid mask type at index {idx}, expected PIL.Image. Using zero mask.")
+                processed_mask = torch.zeros(1, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size)
+            else:
+                if mask.mode != 'L':
+                    mask = mask.convert('L')
+                if self.mask_processor is not None:
+                    processed_mask = self.mask_processor(mask)
+                else:
+                    # 如果未提供 mask_processor，尝试用 image_processor（不推荐）
+                    try:
+                        processed_mask = self.image_processor(mask)  # 可能出错或产生非二值结果
+                    except Exception as e:
+                        warnings.warn(f"Failed to process mask at index {idx}: {e}. Using zero mask.")
+                        processed_mask = torch.zeros(1, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size)
+        else:
+            # ✅ 自动生成全零掩码（统一输出结构）
+            processed_mask = torch.zeros(1, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size)
         return {
-            "image": processed_image,
-            "text_data": self.question_prompt,  # 固定的问题提示
-            "answer": answer  # 包含EOS的答案
+            "image": processed_image,      # (3, H, W)
+            "text_data": self.question_prompt,
+            "answer": answer,              # str with EOS tokens
+            "mask": processed_mask,        # (1, H, W) float tensor of 0.0/1.0, or None
+            "label": label                 # int: 0, 1, or 2
         }

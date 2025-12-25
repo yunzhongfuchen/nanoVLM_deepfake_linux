@@ -250,6 +250,67 @@ class LanguageModel(nn.Module):
 
         return x
 
+    def resize_token_embeddings(self, new_num_tokens: int):
+        """
+        调整模型的 token embeddings 层和输出头 (lm_head) 的大小。
+        
+        Args:
+            new_num_tokens (int): 新的词汇表大小
+        
+        Returns:
+            torch.nn.Embedding: 新的 token embedding 层
+        """
+        old_vocab_size = self.cfg.lm_vocab_size
+        embed_dim = self.cfg.lm_hidden_dim
+
+        if new_num_tokens == old_vocab_size:
+            return self.token_embedding  # 没有变化，直接返回
+
+        print(f"Resizing token embeddings from {old_vocab_size} to {new_num_tokens}")
+
+        # -----------------------------
+        # Step 1: Resize Token Embeddings
+        # -----------------------------
+        old_embed = self.token_embedding
+        new_embed = nn.Embedding(new_num_tokens, embed_dim)
+        # 初始化新嵌入层（与原始 _init_weights 一致）
+        nn.init.normal_(new_embed.weight, mean=0.0, std=0.02)
+
+        # 复制原有词向量
+        num_copy = min(old_vocab_size, new_num_tokens)
+        new_embed.weight.data[:num_copy] = old_embed.weight.data[:num_copy]
+        # 注意：新增的部分已由上面的 init.normal_ 初始化
+
+        # 替换嵌入层
+        self.token_embedding = new_embed
+        self.cfg.lm_vocab_size = new_num_tokens  # 更新配置中的 vocab size
+
+        # -----------------------------
+        # Step 2: Resize LM Head (output projection)
+        # -----------------------------
+        if hasattr(self, 'head'):
+            old_head = self.head
+            # 创建新的 head
+            new_head = nn.Linear(embed_dim, new_num_tokens, bias=False)
+            nn.init.normal_(new_head.weight, mean=0.0, std=0.02)
+
+            # 复制原有权重
+            num_copy_head = min(old_vocab_size, new_num_tokens)
+            new_head.weight.data[:num_copy_head] = old_head.weight.data[:num_copy_head]
+
+            self.head = new_head
+
+            # -----------------------------
+            # Step 3: Handle Weight Tying
+            # -----------------------------
+            if self.lm_tie_weights:
+                self.head.weight = self.token_embedding.weight
+                # 确保共享权重后梯度一致
+                print("Weight tying enabled: tied token_embedding and lm_head")
+        
+        print(f"✅ Successfully resized token embeddings and head to {new_num_tokens} tokens.")
+        return new_embed
+
     @torch.no_grad()
     def generate(self, inputs, max_new_tokens=20):
         # Add batch dimension if needed

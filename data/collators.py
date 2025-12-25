@@ -9,10 +9,14 @@ class VQACollator(object):  # Visual Question Answering Collator
         images = [item["image"] for item in batch]
         texts = [item["text_data"] for item in batch]
         answers = [item["answer"] for item in batch]
+        # 新增：提取 label 和 mask
+        labels_cls = [item["label"] for item in batch]          # 分类标签 (0/1/2)
+        masks = [item["mask"] for item in batch]                # 掩码列表
 
-        # Stack images
+        # Stack 到 batch 维度
         images = torch.stack(images)
-
+        masks = torch.stack(masks)
+        labels_cls = torch.tensor(labels_cls, dtype=torch.long)
         # Create inputs by concatenating the question and answer
         input_sequences = []
         for i in range(len(texts)):
@@ -69,7 +73,10 @@ class VQACollator(object):  # Visual Question Answering Collator
             "image": images,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": labels
+            "labels": labels,
+            # 新增字段（保持原变量名风格）
+            "labels_cls": labels_cls,
+            "mask": masks
         }
 
 class MMStarCollator(object):  # https://huggingface.co/datasets/Lin-Chen/MMStar
@@ -80,9 +87,11 @@ class MMStarCollator(object):  # https://huggingface.co/datasets/Lin-Chen/MMStar
         images = [item["image"] for item in batch]
         questions = [item["text_data"] for item in batch]
         answers = [item["answer"] for item in batch]
-
+        labels_cls = [item["label"] for item in batch]
         # Stack images
         images = torch.stack(images)
+        # 将分类标签转换为tensor
+        labels_cls = torch.tensor(labels_cls, dtype=torch.long)
         
         encoded_question_sequences = self.tokenizer.batch_encode_plus(
             questions,
@@ -103,4 +112,5 @@ class MMStarCollator(object):  # https://huggingface.co/datasets/Lin-Chen/MMStar
             "input_ids": encoded_question_sequences['input_ids'],
             "attention_mask": encoded_question_sequences['attention_mask'],
             "labels": encoded_answer_sequences['input_ids'],
+            "labels_cls": labels_cls,
         }
