@@ -159,3 +159,94 @@ class SIDataset(Dataset):
             "mask": processed_mask,        # (1, H, W) float tensor of 0.0/1.0, or None
             "label": label                 # int: 0, 1, or 2
         }
+
+import os
+from pathlib import Path
+class AuthFolderDataset(Dataset):
+    """
+    从一个大目录下的三个子文件夹(real, tampered, full_synthetic)读取图片，
+    并把类别转成文本答案，例如:
+        real          -> "The image is real"
+        tampered      -> "The image is tampered"
+        full_synthetic-> "The image is full synthetic"
+    """
+
+    def __init__(self, root_dir, tokenizer, image_processor):
+        self.root_dir = Path(root_dir)
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+
+        # 文件夹名 -> 文本答案
+        self.class_to_answer = {
+            "real": "<CLS> The image is real",
+            "tampered": "<CLS> The image is tampered <SEG>",
+            "full_synthetic": "<CLS> The image is full synthetic",
+        }
+
+        # 新增：文件夹名 -> 分类标签（按你的要求）
+        self.class_to_label = {
+            "real": 0,
+            "tampered": 2,
+            "full_synthetic": 1,
+        }
+
+        self.class_names = list(self.class_to_answer.keys())
+
+        # 收集样本 (path, class_name)
+        self.samples = []
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+        for cls in self.class_names:
+            cls_dir = self.root_dir / cls
+            if not cls_dir.is_dir():
+                print(f"[WARN] 子目录不存在: {cls_dir}")
+                continue
+
+            for fname in os.listdir(cls_dir):
+                path = cls_dir / fname
+                if path.suffix.lower() not in exts:
+                    continue
+                self.samples.append((path, cls))
+
+        if len(self.samples) == 0:
+            raise RuntimeError(
+                f"在 {self.root_dir} 下没有找到任何图片（real/tampered/full_synthetic）"
+            )
+
+        print(f"[INFO] AuthFolderDataset: 共 {len(self.samples)} 张图片")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, cls_name = self.samples[idx]
+
+        # --- 读图 ---
+        try:
+            image = Image.open(img_path)
+        except Exception as e:
+            print(f"[ERROR] 打开图片失败: {img_path}, error: {e}")
+            processed_image = torch.zeros(
+                3, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size
+            )
+        else:
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            processed_image = self.image_processor(image)
+
+        # --- 构造 QA 文本 ---
+        question = "Classify the authenticity of this image as real, tampered, or full synthetic."
+        answer_text = self.class_to_answer[cls_name]
+        answer = answer_text + self.tokenizer.eos_token * 3
+        formatted_text = f"Question: {question} Answer:"
+
+        # --- 获取分类标签 ---
+        cls_label = self.class_to_label[cls_name]
+        processed_mask = torch.zeros(1, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size)
+        return {
+            "image": processed_image,
+            "text_data": formatted_text,
+            "answer": answer,
+            "mask": processed_mask,
+            "label": cls_label,  # 👈 新增字段
+        }

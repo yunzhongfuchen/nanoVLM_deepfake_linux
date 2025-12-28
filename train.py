@@ -8,14 +8,14 @@ import argparse
 import torch.optim as optim
 from dataclasses import asdict
 from datasets import load_dataset, concatenate_datasets
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(0)
 
 from data.collators import VQACollator, MMStarCollator
-from data.datasets import MMStarDataset, VQADataset, SIDataset
+from data.datasets import MMStarDataset, VQADataset, SIDataset, AuthFolderDataset
 from data.processors import get_image_processor, get_tokenizer
 from models.vision_language_model import VisionLanguageModel
 import models.config as config
@@ -189,6 +189,97 @@ def get_dataloaders_linux(train_cfg, vlm_cfg):
 
     return train_loader, val_loader, test_loader
 
+def get_dataloader_win(train_cfg, vlm_cfg):
+    # 1. tokenizer & image_processor
+    image_processor = get_image_processor(vlm_cfg.vit_img_size)
+    tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
+
+    # 2. 随机种子（用于划分 train/val + DataLoader）
+    g = torch.Generator()
+    g.manual_seed(0)
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        numpy.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    # 3. 训练+验证数据：从 train_dataset_local_path 下的 real/tampered/full_synthetic 读取
+    train_root = train_cfg.train_dataset_local_path  # 例如：D:/data/train_auth
+    full_train_dataset = AuthFolderDataset(
+        root_dir=train_root,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+    )
+
+    # 4. 可选 data_cutoff_idx 截断
+    if train_cfg.data_cutoff_idx is None:
+        base_dataset = full_train_dataset
+    else:
+        max_idx = min(len(full_train_dataset), train_cfg.data_cutoff_idx)
+        indices = list(range(max_idx))
+        base_dataset = torch.utils.data.Subset(full_train_dataset, indices)
+
+    total_samples = len(base_dataset)
+
+    # 5. 按 val_ratio 划分 train / val
+    val_size = int(total_samples * train_cfg.val_ratio)
+    train_size = total_samples - val_size
+
+    train_dataset, val_dataset = random_split(
+        base_dataset,
+        [train_size, val_size],
+        generator=g,
+    )
+
+    # 6. 测试数据：同样方式，但从 test_dataset_local_path 路径下的三个文件夹读取
+    test_root = train_cfg.test_dataset_local_path   # 例如：D:/data/test_auth
+    test_dataset = AuthFolderDataset(
+        root_dir=test_root,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+    )
+
+    # 7. collator：训练 / 验证 / 测试全用 VQACollator
+    vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
+    mmstar_collator = MMStarCollator(tokenizer)
+
+    # 8. DataLoader（注意 seed_worker 要在文件顶层定义）
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=True,
+        collate_fn=vqa_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        collate_fn=vqa_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=train_cfg.mmstar_batch_size,  # 你原来的 test batch size
+        shuffle=False,
+        collate_fn=mmstar_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    return train_loader, val_loader, test_loader
 
 def test_mmstar(model, tokenizer, test_loader, device):
     model.eval()
@@ -216,12 +307,14 @@ def test_mmstar(model, tokenizer, test_loader, device):
     return accuracy
 
 def test_auth_dataset(model, tokenizer, test_loader, device):
+    print(f"------------------ test_auth_dataset ------------------")
     model.eval()
     total = 0
     correct = 0
+    print_count = 0
 
     with torch.no_grad():
-        for batch in test_loader:
+        for batch_idx, batch in enumerate(test_loader):
             images = batch["images"].to(device)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -248,11 +341,12 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
             pred_answers = [p.strip().lower() for p in pred_answers]
 
             # 只打印第一个样本的信息
-            if batch_size > 0:
-                print(f"================First sample in batch:===================")
+            if batch_size > 0 and print_count < 3:
+                print(f"================ Batch {batch_idx} | First sample: ===================")
                 print(f"  Generated Text: '{pred_answers[0]}' -> GT Text: '{gt_answers[0]}'")
                 print(f"  Classification Pred: '{cls_pred[0].item() if hasattr(cls_pred[0], 'item') else cls_pred[0]}' -> GT Label: '{labels_cls[0].item() if hasattr(labels_cls[0], 'item') else labels_cls[0]}'")
                 print("========================================================")
+                print_count += 1
 
             # 3) 比较预测和真实答案
             for pred, gt in zip(pred_answers, gt_answers):
@@ -302,7 +396,10 @@ def get_lr(it, max_lr, max_steps):
     return min_lr + coeff * (max_lr - min_lr)
 
 def train(train_cfg, vlm_cfg):
-    train_loader, val_loader, test_loader = get_dataloaders_linux(train_cfg, vlm_cfg)
+    if train_cfg.local_file:
+        train_loader, val_loader, test_loader = get_dataloader_win(train_cfg, vlm_cfg)
+    else:
+        train_loader, val_loader, test_loader = get_dataloaders_linux(train_cfg, vlm_cfg)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
 
     total_dataset_size = len(train_loader.dataset)
