@@ -189,6 +189,12 @@ def get_dataloaders_linux(train_cfg, vlm_cfg):
 
     return train_loader, val_loader, test_loader
 
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    numpy.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 def get_dataloader_win(train_cfg, vlm_cfg):
     # 1. tokenizer & image_processor
     image_processor = get_image_processor(vlm_cfg.vit_img_size)
@@ -197,10 +203,6 @@ def get_dataloader_win(train_cfg, vlm_cfg):
     # 2. 随机种子（用于划分 train/val + DataLoader）
     g = torch.Generator()
     g.manual_seed(0)
-    def seed_worker(worker_id):
-        worker_seed = torch.initial_seed() % 2**32
-        numpy.random.seed(worker_seed)
-        random.seed(worker_seed)
 
     # 3. 训练+验证数据：从 train_dataset_local_path 下的 real/tampered/full_synthetic 读取
     train_root = train_cfg.train_dataset_local_path  # 例如：D:/data/train_auth
@@ -504,6 +506,7 @@ def train(train_cfg, vlm_cfg):
                 if epoch_accuracy > best_accuracy:
                     best_accuracy = epoch_accuracy
                     model.save_pretrained(save_directory=vlm_cfg.vlm_checkpoint_path)
+                    tokenizer.save_pretrained(vlm_cfg.vlm_checkpoint_path)
                     print(f"Step: {global_step}, Loss: {batch_loss:.4f}, Tokens/s: {tokens_per_second:.2f}, Val Loss: {avg_val_loss:.4f}, Accuracy: {epoch_accuracy:.4f} | Saving checkpoint to {vlm_cfg.vlm_checkpoint_path}")
                 else:
                     print(f"Step: {global_step}, Loss: {batch_loss:.4f}, Tokens/s: {tokens_per_second:.2f}, Val Loss: {avg_val_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")

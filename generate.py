@@ -1,6 +1,8 @@
 import argparse
 import torch
 from PIL import Image
+from transformers import AutoTokenizer
+import os
 
 torch.manual_seed(0)
 if torch.cuda.is_available():
@@ -48,7 +50,14 @@ def main():
     model = VisionLanguageModel.from_pretrained(source).to(device)
     model.eval()
 
-    tokenizer = get_tokenizer(model.cfg.lm_tokenizer)
+    if args.checkpoint and os.path.isdir(args.checkpoint):
+        print(f"Loading tokenizer weights from: {args.checkpoint}")
+        tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, use_fast=True)
+        if tokenizer.pad_token_id is None:
+            print("Tokenizer has not pad_token")
+            tokenizer.pad_token = tokenizer.eos_token
+    else:
+        tokenizer = get_tokenizer(model.cfg.lm_tokenizer)
     image_processor = get_image_processor(model.cfg.vit_img_size)
 
     template = f"Question: {args.prompt} Answer:"
