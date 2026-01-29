@@ -309,7 +309,6 @@ def test_mmstar(model, tokenizer, test_loader, device):
     return accuracy
 
 def test_auth_dataset(model, tokenizer, test_loader, device):
-    print(f"------------------ test_auth_dataset ------------------")
     model.eval()
     total = 0
     correct = 0
@@ -344,10 +343,9 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
 
             # 只打印第一个样本的信息
             if batch_size > 0 and print_count < 3:
-                print(f"================ Batch {batch_idx} | First sample: ===================")
+                print(f"Batch {batch_idx} | First sample:")
                 print(f"  Generated Text: '{pred_answers[0]}' -> GT Text: '{gt_answers[0]}'")
                 print(f"  Classification Pred: '{cls_pred[0].item() if hasattr(cls_pred[0], 'item') else cls_pred[0]}' -> GT Label: '{labels_cls[0].item() if hasattr(labels_cls[0], 'item') else labels_cls[0]}'")
-                print("========================================================")
                 print_count += 1
 
             # 3) 比较预测和真实答案
@@ -375,7 +373,7 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
                 if gt_label == pred_label:
                     correct += 1
                 total += 1
-
+        print("========================================================")
     model.train()
     return correct / total if total > 0 else 0.0
 

@@ -14,6 +14,9 @@ def get_tokenizer(name):
         if tokens_to_add:
             num_added = tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
             print(f"✅ 添加了 {num_added} 个新特殊 token: {tokens_to_add}")
+            print(f"✅ <CLS> token id: {tokenizer.convert_tokens_to_ids('<CLS>')}")
+            print(f"✅ <SEG> token id: {tokenizer.convert_tokens_to_ids('<SEG>')}")
+            
         else:
             print("🟢 所需 token 已存在，无需添加")
 

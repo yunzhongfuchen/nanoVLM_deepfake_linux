@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_model, save_model
+from data.processors import get_image_processor, get_tokenizer
 
 class VisionLanguageModel(nn.Module):
     def __init__(self, cfg: VLMConfig, load_backbone=True):
@@ -29,6 +30,8 @@ class VisionLanguageModel(nn.Module):
         self.MP = ModalityProjector(cfg)
         # === 分类头：从 [CLS] 向量预测类别 ===
         # 我们使用一个小型 MLP：hidden_size -> hidden_size -> num_classes
+        self.tokenizer = get_tokenizer(cfg.lm_tokenizer)
+        self.cls_token_id = self.tokenizer.convert_tokens_to_ids("<CLS>")
         self.hidden_size = cfg.lm_hidden_dim  # 用于分类头
         self.num_classes = 3  # 三分类任务
         self.classifier = nn.Sequential(
@@ -58,12 +61,22 @@ class VisionLanguageModel(nn.Module):
             attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
 
         # === 注意：此时 logits 实际上是隐藏状态（not final logits）===
-        logits = self.decoder(combined_embd, attention_mask)  # [B, N_img+T, D]
+        hidden_states = self.decoder(combined_embd, attention_mask)  # [B, N_img+T, D]
 
-        # === 提取 [CLS] 位置进行分类（必须在这一步完成，因为后面会覆盖 logits）===
-        cls_position = image_embd.size(1)  # [CLS] 在拼接后的位置
-        cls_hidden_state = logits[:, cls_position:cls_position+1, :]  # [B, 1, D]
-        class_logits = self.classifier(cls_hidden_state).squeeze(1)  # [B, 3]
+        # cls_hidden = self._extract_token_hidden_states(
+        #     hidden_states=hidden_states,
+        #     token_ids=input_ids,
+        #     target_token_id=self.cls_token_id,
+        #     img_seq_len=image_embd.size(1),
+        #     fallback_to_img_last=True
+        # )
+        cls_hidden = self._extract_token_hidden_states(
+            hidden_states=hidden_states,
+            absolute_position=64,
+            full_token_ids=input_ids,      # ← 传入 input_ids 用于解码
+            debug=False
+        )
+        class_logits = self.classifier(cls_hidden).squeeze(1)  # [B, 3]
 
         cls_loss = None
         if targets_cls is not None:
@@ -73,7 +86,7 @@ class VisionLanguageModel(nn.Module):
         loss = None
         if targets is not None:
             # Only use the token part of the logits for loss computation
-            logits = self.decoder.head(logits)
+            logits = self.decoder.head(hidden_states)
             logits = logits[:, image_embd.size(1):, :]
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
 
@@ -109,13 +122,7 @@ class VisionLanguageModel(nn.Module):
             # Create mask of 1s for image tokens (all image tokens should be attended to)
             image_attention_mask = torch.ones((batch_size, img_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
             attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
-        
-        # === 🔽 新增：使用完整上下文提取 [CLS] 并分类 ===
-        hidden_states = self.decoder(combined_embd, attention_mask)  # 获取上下文表示
-        cls_hidden = hidden_states[:, img_seq_len:img_seq_len+1, :]  # 提取 [CLS] 对应的隐藏状态
-        class_logits = self.classifier(cls_hidden).squeeze(1)         # 分类头输出
-        cls_pred = class_logits.argmax(dim=-1)                      # 预测类别 [B]
-        # === 🔼 新增结束 ===
+    
 
         # Generate from combined embeddings using the decoder
         # We need to use the decoder's forward function and not its generate method
@@ -146,8 +153,122 @@ class VisionLanguageModel(nn.Module):
             if attention_mask is not None:
                 attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)), dim=1)
         
+        # 再次前向传播，获取最终的 hidden states（包含所有生成 token 的上下文表示）
+        full_token_ids = torch.cat([input_ids, generated_tokens], dim=1)  # [B, prompt_len + max_new_tokens]
+
+        final_hidden_states = self.decoder(outputs, attention_mask)
+
+        # === 使用统一函数提取 [CLS] ===
+        # cls_hidden = self._extract_token_hidden_states(
+        #     hidden_states=final_hidden_states,
+        #     token_ids=full_token_ids,
+        #     target_token_id=self.cls_token_id,
+        #     img_seq_len=image_embd.size(1),
+        #     fallback_to_img_last=True
+        # )
+        cls_hidden = self._extract_token_hidden_states(
+            hidden_states=final_hidden_states,
+            absolute_position=64,
+            full_token_ids=full_token_ids, # ← 传入完整文本 tokens
+            debug=False
+)
+        class_logits = self.classifier(cls_hidden)  # [B, num_classes]
+        cls_pred = class_logits.argmax(dim=-1)
         # === ✅ 修改返回值 ===
         return generated_tokens, cls_pred
+
+    # def _extract_token_hidden_states(
+    #     self,
+    #     hidden_states,          # [B, L, D] - 完整序列的 hidden states
+    #     token_ids,              # [B, T] - 原始 token ID 序列（仅文本部分）
+    #     target_token_id,        # int - 要查找的 token ID（如 cls_token_id）
+    #     img_seq_len,            # int - 图像 token 数量
+    #     fallback_to_img_last=True  # bool - 未找到时是否回退到图像最后一个 token
+    # ):
+    #     """
+    #     从完整 hidden_states 中提取第一个 target_token_id 对应的隐藏状态。
+        
+    #     Args:
+    #         hidden_states: [B, total_seq_len, D]
+    #         token_ids: [B, text_seq_len] —— 注意：只包含文本 token（不含图像）
+    #         target_token_id: 要查找的 token ID（如 self.cls_token_id）
+    #         img_seq_len: 图像部分的长度
+    #         fallback_to_img_last: 若未找到，是否回退到图像最后一个 token（位置 img_seq_len - 1）
+        
+    #     Returns:
+    #         extracted_hidden: [B, D] —— 每个样本提取出的隐藏状态
+    #     """
+    #     batch_size = hidden_states.size(0)
+    #     device = hidden_states.device
+
+    #     # 在文本 token 中查找目标 token
+    #     cls_mask = (token_ids == target_token_id)  # [B, T]
+    #     has_target = cls_mask.any(dim=1)           # [B]
+    #     first_pos_in_text = cls_mask.long().argmax(dim=1)  # [B]
+
+    #     # 计算绝对位置（在完整序列中的索引）
+    #     if fallback_to_img_last:
+    #         fallback_pos = img_seq_len - 1  # 图像最后一个 token
+    #     else:
+    #         fallback_pos = 0  # 或抛出错误，根据需求
+
+    #     abs_positions = torch.where(
+    #         has_target,
+    #         img_seq_len + first_pos_in_text,  # 文本部分从 img_seq_len 开始
+    #         fallback_pos
+    #     )  # [B]
+
+    #     # 向量化提取
+    #     batch_indices = torch.arange(batch_size, device=device)
+    #     extracted_hidden = hidden_states[batch_indices, abs_positions, :]  # [B, D]
+        
+    def _extract_token_hidden_states(
+        self,
+        hidden_states,          # [B, L, D]
+        absolute_position=64,   # 固定位置
+        full_token_ids=None,    # [B, L_text] - 完整文本 token IDs（用于调试，可选）
+        debug=False             # 是否打印
+    ):
+        """
+        从 hidden_states 中提取固定绝对位置的隐藏状态。
+        
+        Args:
+            hidden_states: [B, total_seq_len, D]
+            absolute_position: int
+            full_token_ids: [B, text_seq_len], 仅用于调试解码（不含图像 tokens）
+            debug: bool
+        """
+        batch_size = hidden_states.size(0)
+        total_seq_len = hidden_states.size(1)
+        device = hidden_states.device
+
+        if absolute_position >= total_seq_len:
+            raise IndexError(f"Position {absolute_position} out of range (seq_len={total_seq_len})")
+
+        if debug:
+            print(f"\n=== Extracting hidden state at absolute position: {absolute_position} ===")
+            if full_token_ids is not None:
+                img_seq_len = total_seq_len - full_token_ids.size(1)  # 推断图像长度
+                text_pos = absolute_position - img_seq_len
+                if text_pos >= 0 and text_pos < full_token_ids.size(1):
+                    for b in range(min(batch_size, 2)):  # 只打印前2个样本
+                        token_id = full_token_ids[b, text_pos].item()
+                        decoded = "N/A"
+                        if hasattr(self, 'tokenizer'):
+                            try:
+                                decoded = self.tokenizer.decode([token_id], skip_special_tokens=False)
+                            except:
+                                pass
+                        print(f"  Sample {b}: token_id={token_id}, decoded='{decoded}' (text pos={text_pos})")
+                else:
+                    print(f"  Warning: absolute_position {absolute_position} is within image tokens (img_seq_len={img_seq_len})")
+            else:
+                print("  (full_token_ids not provided, skipping token decoding)")
+            print("==================================================\n")
+
+        batch_indices = torch.arange(batch_size, device=device)
+        extracted_hidden = hidden_states[batch_indices, absolute_position, :]
+        return extracted_hidden
 
 
     @classmethod

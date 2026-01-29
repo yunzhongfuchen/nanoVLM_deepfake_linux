@@ -25,9 +25,9 @@ def parse_args():
     )
     parser.add_argument("--image", type=str, default="assets/image.png",
                         help="Path to input image")
-    parser.add_argument("--prompt", type=str, default="What is this?",
+    parser.add_argument("--prompt", type=str, default="Is this image real, full synthetic or tampered?",
                         help="Text prompt to feed the model")
-    parser.add_argument("--generations", type=int, default=5,
+    parser.add_argument("--generations", type=int, default=1,
                         help="Num. of outputs to generate")
     parser.add_argument("--max_new_tokens", type=int, default=20,
                         help="Maximum number of tokens per output")
@@ -70,7 +70,7 @@ def main():
     print("\nInput:\n ", args.prompt, "\n\nOutputs:")
     for i in range(args.generations):
         gen, cls_pred = model.generate(tokens, img_t, max_new_tokens=args.max_new_tokens)
-        out = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
+        out = tokenizer.batch_decode(gen, skip_special_tokens=False)[0]
         print(f"  >>cls_pred: {cls_pred} Generation {i+1}: {out}")
 
 
