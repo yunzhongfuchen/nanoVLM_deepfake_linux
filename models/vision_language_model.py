@@ -8,12 +8,13 @@ from typing import Optional
 from models.vision_transformer import ViT
 from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
+from models.segmentation import ViTMAEDecoder
 from models.config import VLMConfig
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_model, save_model
+from safetensors.torch import load_model, save_model, load_file
 from data.processors import get_image_processor, get_tokenizer
 
 class VisionLanguageModel(nn.Module):
@@ -40,10 +41,19 @@ class VisionLanguageModel(nn.Module):
             nn.Dropout(0.1),  # 可调
             nn.Linear(self.hidden_size, self.num_classes)
         )
+        # 视觉解码器
+        self.vision_decoder = ViTMAEDecoder(freeze_decoder=False)
         self.load_backbone = load_backbone
 
-    def forward(self, input_ids, image, attention_mask, targets, targets_cls):
+    def forward(self, input_ids, image, attention_mask, targets, targets_cls, targets_mask):
         image_embd = self.vision_encoder(image)
+        # 🔥 新增：视觉重建（在 MP 之前！）
+        mask_pred = self.vision_decoder(image_embd)  # [B, 3, 224, 224]
+        image_loss = None
+        if targets_mask is not None:
+            image_loss = F.mse_loss(mask_pred, targets_mask)  # 计算重建损失
+
+            
         image_embd = self.MP(image_embd)
 
         token_embd = self.decoder.token_embedding(input_ids)
@@ -60,7 +70,7 @@ class VisionLanguageModel(nn.Module):
             # Combine image and token attention masks
             attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
 
-        # === 注意：此时 logits 实际上是隐藏状态（not final logits）===
+
         hidden_states = self.decoder(combined_embd, attention_mask)  # [B, N_img+T, D]
 
         # cls_hidden = self._extract_token_hidden_states(
@@ -91,22 +101,30 @@ class VisionLanguageModel(nn.Module):
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
 
         # === 合并总损失 ===
+        # total_loss = None
+        # if loss is not None and cls_loss is not None:
+        #     total_loss = loss + cls_loss
+        # elif loss is not None:
+        #     total_loss = loss
+        # elif cls_loss is not None:
+        #     total_loss = cls_loss
         total_loss = None
-        if loss is not None and cls_loss is not None:
-            total_loss = loss + cls_loss
-        elif loss is not None:
+        if loss is not None:
             total_loss = loss
-        elif cls_loss is not None:
-            total_loss = cls_loss
+        if cls_loss is not None:
+            total_loss += cls_loss
+        if image_loss is not None:
+            total_loss += image_loss  # ← 从重建损失开始
 
         # === 返回三项结果 ===
-        return logits, total_loss, class_logits
+        return logits, total_loss, class_logits, mask_pred
 
 
     @torch.no_grad()
     def generate(self, input_ids, image, attention_mask=None, max_new_tokens=20):
         # Process image through vision encoder and projection
         image_embd = self.vision_encoder(image)
+        mask_pred = self.vision_decoder(image_embd)
         image_embd = self.MP(image_embd)
         
         # Embed initial tokens
@@ -175,7 +193,7 @@ class VisionLanguageModel(nn.Module):
         class_logits = self.classifier(cls_hidden)  # [B, num_classes]
         cls_pred = class_logits.argmax(dim=-1)
         # === ✅ 修改返回值 ===
-        return generated_tokens, cls_pred
+        return generated_tokens, cls_pred, mask_pred
 
     # def _extract_token_hidden_states(
     #     self,
@@ -316,7 +334,20 @@ class VisionLanguageModel(nn.Module):
         model = cls(cfg, load_backbone=False)
 
         # Load safetensors weights
-        load_model(model, weights_path)
+        # === 修改此处：替换原 load_model(model, weights_path) ==
+
+        # 获取模型设备（安全处理无参数情况）
+        device = next(model.parameters()).device if next(model.parameters(), None) is not None else torch.device("cpu")
+        
+        # 加载并过滤：仅保留键存在且形状匹配的参数
+        state_dict = load_file(weights_path, device=str(device))
+        filtered_state_dict = {
+            k: v for k, v in state_dict.items()
+            if k in model.state_dict() and v.shape == model.state_dict()[k].shape
+        }
+        model.load_state_dict(filtered_state_dict, strict=False)  # strict=False 允许模型有额外参数
+        print("✅ Model loaded")
+        # === 修改结束 ===
 
         # Done!
         return model

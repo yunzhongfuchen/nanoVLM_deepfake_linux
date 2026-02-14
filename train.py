@@ -24,6 +24,11 @@ import models.utils as utils
 #Otherwise, the tokenizer will through a warning
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import warnings
+warnings.filterwarnings("error", category=UserWarning, module="torch._dynamo.utils")
+# 或更通用（兼容旧版 PyTorch）：
+# warnings.filterwarnings("error", message=".*target size.*input size.*")
+
 
 def get_run_name(train_cfg):
     dataset_size = "full_ds" if train_cfg.data_cutoff_idx is None else f"{train_cfg.data_cutoff_idx}samples"
@@ -337,7 +342,7 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
                     gt_answers.append(gt.strip().lower())
 
             # 2) 让模型生成答案
-            gen_ids, cls_pred = model.generate(input_ids, images, attention_mask)
+            gen_ids, cls_pred, mask_pred = model.generate(input_ids, images, attention_mask)
             pred_answers = tokenizer.batch_decode(gen_ids, skip_special_tokens=False)
             pred_answers = [p.strip().lower() for p in pred_answers]
 
@@ -430,7 +435,7 @@ def train(train_cfg, vlm_cfg):
     # Define optimizer groups
     # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
     # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
-    param_groups = [{'params': model.MP.parameters(), 'lr': train_cfg.lr_mp},
+    param_groups = [{'params': list(model.MP.parameters()) + list(model.classifier.parameters()) + list(model.vision_decoder.parameters()), 'lr': train_cfg.lr_mp},+
                     {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}]
     optimizer = optim.AdamW(param_groups)
 
@@ -455,11 +460,13 @@ def train(train_cfg, vlm_cfg):
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels_cls = batch["labels_cls"].to(device)
+            mask = batch["mask"].to(device)
 
             optimizer.zero_grad()
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16): # Set to float16 if your hardware doesn't support bfloat16ß
-                _, loss, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls)
+                _, loss, _, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls, targets_mask = mask)
+                # _, loss, _, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls)
 
             loss.backward()
 
@@ -495,8 +502,8 @@ def train(train_cfg, vlm_cfg):
                         labels_cls = batch["labels_cls"].to(device)
 
                         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            _, loss, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls)
-
+                            _, loss, _, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls, targets_mask = mask)
+                            # _, loss, _, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls)
                         total_val_loss += loss.item()
                     avg_val_loss = total_val_loss / len(val_loader)
                 model.train()

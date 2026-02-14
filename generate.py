@@ -69,9 +69,15 @@ def main():
 
     print("\nInput:\n ", args.prompt, "\n\nOutputs:")
     for i in range(args.generations):
-        gen, cls_pred = model.generate(tokens, img_t, max_new_tokens=args.max_new_tokens)
+        gen, cls_pred, mask_pred= model.generate(tokens, img_t, max_new_tokens=args.max_new_tokens)
         out = tokenizer.batch_decode(gen, skip_special_tokens=False)[0]
         print(f"  >>cls_pred: {cls_pred} Generation {i+1}: {out}")
+
+        mask_2d = mask_pred[0, 0]  # [224, 224]
+        mask_norm = (mask_2d - mask_2d.min()) / (mask_2d.max() - mask_2d.min() + 1e-8)  # [0,1]
+        mask_uint8 = (mask_norm * 255).byte().cpu().numpy()  # → uint8 numpy array
+
+        Image.fromarray(mask_uint8).save(f"mask_pred_{i+1}.png")
 
 
 if __name__ == "__main__":
